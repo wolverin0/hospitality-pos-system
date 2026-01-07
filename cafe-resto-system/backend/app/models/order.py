@@ -24,7 +24,8 @@ class OrderStatus(str, Enum):
     """Status of a confirmed order"""
     PENDING = "pending"               # Submitted, waiting to be processed
     IN_PROGRESS = "in_progress"      # Kitchen is preparing
-    PAID = "paid"                  # Payment completed
+    PARTIALLY_PAID = "partially_paid" # Partial payment received
+    PAID = "paid"                  # Full payment completed
     COMPLETED = "completed"          # Items served, order closed
     CANCELLED = "cancelled"           # Order cancelled by staff
     VOIDED = "voided"              # Order voided by manager

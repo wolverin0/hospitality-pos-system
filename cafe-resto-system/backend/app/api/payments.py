@@ -19,13 +19,14 @@ from app.core.events import (
 from app.models import (
     Payment, PaymentIntent, PaymentMethod, PaymentStatus,
     PaymentIntentStatus, Refund, RefundStatus, RefundReasonCode,
-    User, Order, Shift, CashDrawerEvent, CashDrawerEventType
+    User, Order, Shift, CashDrawerEvent, CashDrawerEventType, OrderStatus
 )
 from app.api.schemas import (
     PaymentIntentCreate, PaymentIntentRead,
     PaymentCreate, PaymentRead, PaymentUpdate,
     RefundCreate, RefundRead
 )
+from app.services.mercadopago import MercadoPagoService
 
 router = APIRouter(prefix="/api/v1/payments", tags=["payments"])
 
@@ -66,6 +67,113 @@ def create_payment_intent(
     session.refresh(payment_intent)
 
     return payment_intent
+
+
+@router.post("/qr-intent", response_model=PaymentIntentRead, status_code=status.HTTP_201_CREATED)
+def create_qr_payment_intent(
+    order_id: uuid.UUID,
+    table_id: Optional[str] = None,
+    expiration_minutes: int = 30,
+    tip_amount: Optional[Decimal] = None,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Create QR code payment intent via Mercado Pago
+
+    Generates QR code for order and returns payment intent with QR data
+    """
+    # Verify order exists
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found"
+        )
+
+    if order.tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+
+    # Check order status (must be in PENDING or IN_PROGRESS)
+    if order.status not in [OrderStatus.PENDING, OrderStatus.IN_PROGRESS, OrderStatus.PARTIALLY_PAID]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Order must be in PENDING, IN_PROGRESS, or PARTIALLY_PAID to create QR payment (current: {order.status.value})"
+        )
+
+    # Generate idempotency key
+    import uuid
+    from datetime import datetime
+    idempotency_key = f"qr_order_{order_id}_{datetime.now().isoformat()}"
+
+    # Get order line items for Mercado Pago
+    from app.models.order_line_item import OrderLineItem
+    from sqlmodel import select
+
+    line_items = session.exec(
+        select(OrderLineItem).where(OrderLineItem.order_id == order_id)
+    ).all()
+
+    items = [
+        {
+            "name": item.name,
+            "unit_price": float(item.price_at_order),
+            "quantity": item.quantity,
+            "id": str(item.menu_item_id) if item.menu_item_id else ""
+        }
+        for item in line_items if not item.is_voided and not item.is_comped
+    ]
+
+    # Calculate total amount including tip
+    total_amount = order.total_amount + (tip_amount or Decimal("0.00"))
+
+    # Generate Mercado Pago QR order
+    try:
+        mp_service = MercadoPagoService()
+        mp_result = mp_service.create_qr_order(
+            table_id=table_id or f"TABLE_{order.table_session_id}" if order.table_session_id else "UNKNOWN",
+            order_id=str(order_id),
+            total_amount=total_amount,
+            items=items,
+            external_reference=idempotency_key,
+            expiration_minutes=expiration_minutes,
+            tip_amount=tip_amount
+        )
+
+        # Create payment intent with QR data
+        payment_intent = PaymentIntent(
+            tenant_id=current_user.tenant_id,
+            order_id=order_id,
+            amount=total_amount,
+            method=PaymentMethod.QR,
+            status=PaymentIntentStatus.PENDING,
+            initiated_by_user_id=current_user.id,
+            qr_code=mp_result.get("qr_data"),
+            qr_provider="mercadopago",
+            idempotency_key=idempotency_key,
+            qr_expires_at=mp_result.get("expires_at"),
+            tip_amount=tip_amount or Decimal("0.00")
+        )
+
+        session.add(payment_intent)
+        session.commit()
+        session.refresh(payment_intent)
+
+        return payment_intent
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Payment service not configured: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create QR payment: {str(e)}"
+        )
 
 
 @router.post("/process", response_model=PaymentRead, status_code=status.HTTP_201_CREATED)
@@ -385,104 +493,91 @@ def process_refund(
     session.commit()
     session.refresh(refund)
 
-    # Update payment status to REFUNDED
-    payment.status = PaymentStatus.REFUNDED
-    payment.refunded_at = datetime.utcnow()
-    session.add(payment)
-
-    # Create CashDrawerEvent if cash refund
-    if payment.method == PaymentMethod.CASH:
-        cash_event = CashDrawerEvent(
-            tenant_id=current_user.tenant_id,
-            order_id=payment.order_id,
-            payment_id=payment.id,
-            location_id=payment.order.location_id,
-            event_type=CashDrawerEventType.CASH_SHORTAGE,
-            amount=-refund_data.amount,
-            balance_after=0,  # Will need to calculate
-            description=f"Refund for order {payment.order_id}",
-            performed_by=current_user.id
-        )
-
-        session.add(cash_event)
-
-    session.commit()
-
-    # Broadcast refund created event
-    from asyncio import create_task
-    create_task(manager.send_refund_created(
-        refund_id=refund.id,
-        payment_id=payment.id,
-        order_id=payment.order_id,
-        table_session_id=payment.order.table_session_id,
-        amount=float(refund.amount),
-        reason=refund.reason
-    ))
-
-    return refund
+    return created_payments
 
 
-@router.post("/split", response_model=List[PaymentRead], status_code=status.HTTP_201_CREATED)
-def create_split_payment(
-    order_id: uuid.UUID,
-    payments: List[PaymentCreate],
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user)
+@router.get("/qr-status/{payment_intent_id}", response_model=PaymentIntentRead)
+def get_qr_payment_status(
+    payment_intent_id: uuid.UUID,
+    session: Session = Depends(get_session)
 ):
-    """Create split payment (multiple methods)"""
-    # Verify order exists
-    order = session.get(Order, order_id)
-    if not order:
+    """
+    Poll payment intent status for guest app
+    Guests can poll this endpoint to check if QR payment was completed
+    """
+    payment_intent = session.get(PaymentIntent, payment_intent_id)
+    if not payment_intent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
+            detail="Payment intent not found"
         )
 
-    if order.tenant_id != current_user.tenant_id:
+    # Check if expired
+    if payment_intent.qr_expires_at and payment_intent.qr_expires_at < datetime.utcnow():
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied"
+            status_code=status.HTTP_410_GONE,
+            detail="Payment intent has expired"
         )
 
-    # Calculate total of split payments
-    total_split_amount = sum(p.amount for p in payments)
-    if abs(total_split_amount - order.total_amount) > Decimal("0.01"):
+    return payment_intent
+
+
+@router.get("/table-session/{table_session_id}/payments", response_model=List[PaymentRead])
+def get_table_session_payments(
+    table_session_id: uuid.UUID,
+    session: Session = Depends(get_session)
+):
+    """
+    Get payment history for a table session
+    Shows all payments made for a table session
+    """
+    from app.models.table_session import TableSession
+
+    # Verify table session exists
+    table_session = session.get(TableSession, table_session_id)
+    if not table_session:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Split payment total ({total_split_amount}) does not match order total ({order.total_amount})"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Table session not found"
         )
 
-    # Create each payment
-    created_payments = []
-    for payment_data in payments:
-        payment = Payment(
-            tenant_id=current_user.tenant_id,
-            order_id=order_id,
-            amount=payment_data.amount,
-            method=payment_data.method,
-            card_last_4=payment_data.card_last_4,
-            card_holder_name=payment_data.card_holder_name,
-            terminal_reference_id=payment_data.terminal_reference_id,
-            qr_code=payment_data.qr_code,
-            processed_by_user_id=current_user.id,
-            created_at=datetime.utcnow()
+    # Get all payments for orders in this table session
+    from sqlmodel import select
+
+    payments = session.exec(
+        select(Payment)
+        .join(Order, Payment.order_id == Order.id)
+        .where(
+            (Order.table_session_id == table_session_id) &
+            (Payment.status == PaymentStatus.COMPLETED)
+        )
+        .order_by(Payment.processed_at.desc())
+    ).all()
+
+    return payments
+
+
+@router.get("/qr-status/{payment_intent_id}", response_model=PaymentIntentRead)
+def get_qr_payment_status(
+    payment_intent_id: uuid.UUID,
+    session: Session = Depends(get_session)
+):
+    """
+    Poll payment intent status for guest app
+    Guests can poll this endpoint to check if QR payment was completed
+    """
+    payment_intent = session.get(PaymentIntent, payment_intent_id)
+    if not payment_intent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment intent not found"
         )
 
-        session.add(payment)
-        session.flush()  # Get IDs before commit
-        created_payments.append(payment)
+    # Check if expired
+    if payment_intent.qr_expires_at and payment_intent.qr_expires_at < datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Payment intent has expired"
+        )
 
-    session.commit()
-
-    # Broadcast payment events
-    from asyncio import create_task
-    for payment in created_payments:
-        create_task(manager.send_payment_created(
-            payment_id=payment.id,
-            order_id=payment.order_id,
-            table_session_id=order.table_session_id,
-            amount=float(payment.amount),
-            method=payment.method.value
-        ))
-
-    return created_payments
+    return payment_intent

@@ -627,6 +627,74 @@ class RefundCreated(DomainEvent):
         return data
 
 
+class PaymentIntentCreated(DomainEvent):
+    """Event fired when a QR payment intent is created"""
+
+    def __init__(
+        self,
+        payment_intent_id: uuid.UUID,
+        order_id: uuid.UUID,
+        table_session_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        amount: float,
+        qr_code: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        event_id: uuid.UUID = None
+    ):
+        super().__init__(event_id)
+        self.payment_intent_id = payment_intent_id
+        self.order_id = order_id
+        self.table_session_id = table_session_id
+        self.tenant_id = tenant_id
+        self.amount = amount
+        self.qr_code = qr_code
+        self.expires_at = expires_at
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data.update({
+            "payment_intent_id": str(self.payment_intent_id),
+            "order_id": str(self.order_id),
+            "table_session_id": str(self.table_session_id),
+            "tenant_id": str(self.tenant_id),
+            "amount": self.amount,
+            "qr_code": self.qr_code,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None
+        })
+        return data
+
+
+class PaymentIntentExpired(DomainEvent):
+    """Event fired when a QR payment intent expires"""
+
+    def __init__(
+        self,
+        payment_intent_id: uuid.UUID,
+        order_id: uuid.UUID,
+        table_session_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        amount: float,
+        event_id: uuid.UUID = None
+    ):
+        super().__init__(event_id)
+        self.payment_intent_id = payment_intent_id
+        self.order_id = order_id
+        self.table_session_id = table_session_id
+        self.tenant_id = tenant_id
+        self.amount = amount
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data.update({
+            "payment_intent_id": str(self.payment_intent_id),
+            "order_id": str(self.order_id),
+            "table_session_id": str(self.table_session_id),
+            "tenant_id": str(self.tenant_id),
+            "amount": self.amount
+        })
+        return data
+
+
 class ShiftOpened(DomainEvent):
     """Event fired when a server opens a shift"""
 

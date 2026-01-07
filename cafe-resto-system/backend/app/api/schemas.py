@@ -97,6 +97,11 @@ class PaymentIntentCreate(SQLModel):
     order_id: uuid.UUID
     amount: Decimal
     method: PaymentMethod
+    idempotency_key: Optional[str] = None
+    qr_mode: Optional[str] = "static"  # "static" or "dynamic"
+    table_id: Optional[str] = None
+    expiration_minutes: Optional[int] = 30
+    tip_amount: Optional[Decimal] = None
 
 
 class PaymentIntentRead(SQLModel):
@@ -106,6 +111,11 @@ class PaymentIntentRead(SQLModel):
     currency: str
     method: PaymentMethod
     status: PaymentIntentStatus
+    qr_code: Optional[str] = None
+    qr_provider: Optional[str] = None
+    qr_expires_at: Optional[datetime] = None
+    idempotency_key: Optional[str] = None
+    tip_amount: Optional[Decimal] = None
     client_secret: Optional[str] = None
     payment_intent_reference: Optional[str] = None
     created_at: datetime

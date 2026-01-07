@@ -5,7 +5,7 @@ Captures "intent" before completion: what the customer/staff wanted to pay with
 """
 
 from sqlmodel import Field, SQLModel, Relationship
-from sqlalchemy import Column, ForeignKey, JSON
+from sqlalchemy import Column, ForeignKey, JSON, Numeric, Index
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING, List
 from decimal import Decimal
@@ -144,12 +144,47 @@ class PaymentIntent(SQLModel, table=True):
         max_length=50,
         description="QR code provider (mercadopago, pix, etc.)"
     )
+    qr_expires_at: Optional[datetime] = Field(
+        default=None,
+        nullable=True,
+        description="When QR code expires (TTL)"
+    )
+
+    # Idempotency for preventing duplicate payment attempts
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        nullable=True,
+        index=True,
+        description="Unique key to prevent duplicate payment intents"
+    )
+
+    # Tip amount (optional for QR payments)
+    tip_amount: Decimal = Field(
+        default=Decimal("0.00"),
+        description="Tip amount (optional for QR payments)",
+        sa_column=Column(Numeric(10, 2), nullable=True)
+    )
 
     # Notes
     notes: Optional[str] = Field(
         max_length=500,
         nullable=True,
         description="Notes about this payment intent"
+    )
+
+    # Reason fields for cancellation/failure
+    cancelled_reason: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        nullable=True,
+        description="Reason why payment intent was cancelled"
+    )
+    failed_reason: Optional[str] = Field(
+        default=None,
+        max_length=500,
+        nullable=True,
+        description="Reason why payment intent failed"
     )
 
     # Version for optimistic concurrency
@@ -169,6 +204,7 @@ class PaymentIntent(SQLModel, table=True):
             {"name": "idx_payment_intent_status", "columns": ["status"]},
             {"name": "idx_payment_intent_method", "columns": ["method"]},
             {"name": "idx_payment_intent_created_at", "columns": ["created_at"]},
+            {"name": "idx_payment_intent_idempotency_key", "columns": ["idempotency_key"]},
         ]
 
     def can_transition_to(self, new_status: PaymentIntentStatus) -> tuple[bool, str]:
