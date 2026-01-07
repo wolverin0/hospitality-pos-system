@@ -1,0 +1,1388 @@
+"""
+Drafts API endpoints with optimistic concurrency, locking, and TTL
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlmodel import Session, select, SQLModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+from decimal import Decimal
+import structlog
+import uuid
+
+from app.core.database import get_session
+from app.core.dependencies import get_tenant_id, get_current_user_id, get_user_role
+from app.core.events import (
+    event_bus, DraftCreated, DraftSubmitted, DraftConfirmed,
+    DraftRejected, DraftReassigned, DraftAcquired
+)
+from app.core.websocket_manager import manager
+from app.models.draft_order import DraftOrder, DraftStatus
+from app.models.draft_line_item import DraftLineItem
+from app.models.table_session import TableSession
+
+logger = structlog.get_logger(__name__)
+router = APIRouter()
+
+
+# Pydantic schemas for request/response
+class DraftLineItemCreate(SQLModel):
+    """Schema for creating a draft line item"""
+    menu_item_id: uuid.UUID
+    name: str
+    quantity: int
+    price_at_order: Decimal
+    special_instructions: Optional[str] = None
+    modifiers: Optional[dict] = None
+    parent_line_item_id: Optional[uuid.UUID] = None
+    sort_order: int = 0
+
+
+class DraftCreate(SQLModel):
+    """Schema for creating a draft"""
+    table_session_id: uuid.UUID
+    special_requests: Optional[str] = None
+
+
+class DraftUpdate(SQLModel):
+    """Schema for updating a draft"""
+    version: int  # Required for optimistic concurrency
+    special_requests: Optional[str] = None
+    line_items: Optional[List[DraftLineItemCreate]] = None
+
+
+class DraftResponse(SQLModel):
+    """Schema for draft response"""
+    id: uuid.UUID
+    table_session_id: uuid.UUID
+    status: DraftStatus
+    version: int
+    locked_by: Optional[uuid.UUID] = None
+    locked_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    expires_at: datetime
+    special_requests: Optional[str] = None
+
+
+class DraftDetailResponse(DraftResponse):
+    """Schema for draft with line items"""
+    line_items: List[DraftLineItem]
+
+
+@router.post("/", response_model=DraftResponse)
+async def create_draft(
+    draft_data: DraftCreate,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Create a new draft order (guest submits)"""
+    try:
+        # Verify table session exists and belongs to tenant
+        table_session = session.exec(
+            select(TableSession).where(
+                TableSession.id == draft_data.table_session_id,
+                TableSession.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not table_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Table session not found"
+            )
+
+        # Create draft
+        draft = DraftOrder(
+            tenant_id=tenant_id,
+            table_session_id=draft_data.table_session_id,
+            status=DraftStatus.DRAFT,
+            special_requests=draft_data.special_requests
+        )
+        session.add(draft)
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftCreated event
+        await event_bus.publish(DraftCreated(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id
+        ))
+
+        logger.info(f"Created draft {draft.id} for session {draft_data.table_session_id}")
+        return draft
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error creating draft: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create draft"
+        )
+
+
+@router.get("/", response_model=List[DraftResponse])
+async def list_drafts(
+    status_filter: Optional[DraftStatus] = Query(None, description="Filter by status"),
+    table_session_id: Optional[uuid.UUID] = Query(None, description="Filter by table session"),
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    user_role: str = Depends(get_user_role),
+    session: Session = Depends(get_session)
+):
+    """List drafts (waiter inbox or guest history)"""
+    try:
+        query = select(DraftOrder).where(DraftOrder.tenant_id == tenant_id)
+
+        # Apply filters
+        if status_filter:
+            query = query.where(DraftOrder.status == status_filter)
+
+        if table_session_id:
+            query = query.where(DraftOrder.table_session_id == table_session_id)
+
+        # Filter expired drafts (waiters shouldn't see expired drafts)
+        query = query.where(DraftOrder.expires_at > datetime.utcnow())
+
+        # Sort by created_at (newest first for inbox)
+        query = query.order_by(DraftOrder.created_at.desc())
+
+        drafts = session.exec(query).all()
+        return drafts
+
+    except Exception as e:
+        logger.error(f"Error listing drafts: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list drafts"
+        )
+
+
+@router.get("/{draft_id}", response_model=DraftDetailResponse)
+async def get_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Get draft details with line items"""
+    try:
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Get line items
+        line_items = session.exec(
+            select(DraftLineItem).where(DraftLineItem.draft_order_id == draft_id)
+            .order_by(DraftLineItem.sort_order)
+        ).all()
+
+        # Return draft with line items
+        return {
+            "id": draft.id,
+            "table_session_id": draft.table_session_id,
+            "status": draft.status,
+            "version": draft.version,
+            "locked_by": draft.locked_by,
+            "locked_at": draft.locked_at,
+            "rejection_reason": draft.rejection_reason,
+            "created_at": draft.created_at,
+            "updated_at": draft.updated_at,
+            "expires_at": draft.expires_at,
+            "special_requests": draft.special_requests,
+            "line_items": line_items
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get draft"
+        )
+
+
+@router.patch("/{draft_id}", response_model=DraftResponse)
+async def update_draft(
+    draft_id: uuid.UUID,
+    update_data: DraftUpdate,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Update draft with optimistic concurrency control"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Optimistic concurrency check
+        if draft.version != update_data.version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Draft was modified by another user. Current version: {draft.version}, your version: {update_data.version}"
+            )
+
+        # Check if draft can be modified
+        if not draft.can_modify():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot modify draft in status: {draft.status}"
+            )
+
+        # Update draft fields
+        if update_data.special_requests is not None:
+            draft.special_requests = update_data.special_requests
+
+        # Update line items if provided
+        if update_data.line_items is not None:
+            # Delete existing line items
+            session.exec(
+                select(DraftLineItem).where(DraftLineItem.draft_order_id == draft_id)
+            ).delete()
+
+            # Add new line items
+            for item_data in update_data.line_items:
+                line_item = DraftLineItem(
+                    tenant_id=tenant_id,
+                    draft_order_id=draft_id,
+                    menu_item_id=item_data.menu_item_id,
+                    name=item_data.name,
+                    quantity=item_data.quantity,
+                    price_at_order=item_data.price_at_order,
+                    special_instructions=item_data.special_instructions,
+                    modifiers=item_data.modifiers,
+                    parent_line_item_id=item_data.parent_line_item_id,
+                    sort_order=item_data.sort_order
+                )
+                # Calculate line total
+                line_item.calculate_line_total()
+                session.add(line_item)
+
+        # Update version and timestamp
+        draft.version += 1
+        draft.updated_at = datetime.utcnow()
+
+        session.commit()
+        session.refresh(draft)
+
+        logger.info(f"Updated draft {draft_id} to version {draft.version}")
+        return draft
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error updating draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update draft"
+        )
+
+
+@router.post("/{draft_id}/submit", response_model=DraftResponse)
+async def submit_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Submit draft for waiter review (guest action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to pending
+        draft.transition_to_pending()
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftSubmitted event
+        await event_bus.publish(DraftSubmitted(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            guest_count=draft.table_session.guest_count if draft.table_session else 1
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_update(
+            draft_id=draft.id,
+            status=draft.status.value,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Submitted draft {draft_id} for review")
+        return draft
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error submitting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit draft"
+        )
+
+
+@router.patch("/{draft_id}/acquire")
+async def acquire_draft_lock(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Acquire lock on draft (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Try to acquire lock
+        try:
+            draft.acquire_lock(current_user_id)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e)
+            )
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftAcquired event
+        await event_bus.publish(DraftAcquired(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_locked(
+            draft_id=draft.id,
+            locked_by=current_user_id,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"User {current_user_id} acquired lock on draft {draft_id}")
+        return {"message": "Lock acquired", "draft_id": str(draft_id), "locked_at": draft.locked_at}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error acquiring lock on draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to acquire lock"
+        )
+
+
+@router.patch("/{draft_id}/confirm")
+async def confirm_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Confirm draft and create order (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # TODO: Create actual order from draft
+        # For now, generate a placeholder order_id
+        order_id = uuid.uuid4()
+
+        # Transition to confirmed
+        draft.transition_to_confirmed(current_user_id, order_id)
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftConfirmed event
+        await event_bus.publish(DraftConfirmed(
+            draft_id=draft.id,
+            order_id=order_id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id,
+            items=[],
+            total_amount=0.0  # TODO: Calculate from line items
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_confirmed(
+            draft_id=draft.id,
+            order_id=order_id,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Confirmed draft {draft_id}, created order {order_id}")
+        return {
+            "message": "Draft confirmed",
+            "draft_id": str(draft_id),
+            "order_id": str(order_id),
+            "confirmed_at": draft.confirmed_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error confirming draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to confirm draft"
+        )
+
+
+@router.patch("/{draft_id}/reject")
+async def reject_draft(
+    draft_id: uuid.UUID,
+    reason: str = Query(..., min_length=1, max_length=1000),
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Reject draft (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to rejected
+        draft.transition_to_rejected(current_user_id, reason)
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftRejected event
+        await event_bus.publish(DraftRejected(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id,
+            reason=reason
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_rejected(
+            draft_id=draft.id,
+            reason=reason,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Rejected draft {draft_id}: {reason}")
+        return {
+            "message": "Draft rejected",
+            "draft_id": str(draft_id),
+            "reason": reason,
+            "rejected_at": draft.rejected_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error rejecting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reject draft"
+        )
+
+
+@router.patch("/{draft_id}/expire")
+async def expire_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Manually expire draft (admin action or background job)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to expired
+        draft.transition_to_expired()
+
+        session.commit()
+        session.refresh(draft)
+
+        logger.info(f"Expired draft {draft_id}")
+        return {
+            "message": "Draft expired",
+            "draft_id": str(draft_id),
+            "expired_at": draft.updated_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error expiring draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to expire draft"
+        )
+
+
+@router.patch("/{draft_id}/reassign")
+async def reassign_draft(
+    draft_id: uuid.UUID,
+    new_table_session_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Reassign draft to different table session"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Verify new table session exists and belongs to tenant
+        new_session = session.exec(
+            select(TableSession).where(
+                TableSession.id == new_table_session_id,
+                TableSession.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not new_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="New table session not found"
+            )
+
+        # Verify draft can be reassigned (only draft or pending status)
+        if draft.status not in [DraftStatus.DRAFT, DraftStatus.PENDING]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot reassign draft in status: {draft.status}"
+            )
+
+        # Store old table session for notification
+        old_table_session_id = draft.table_session_id
+
+        # Reassign draft
+        draft.table_session_id = new_table_session_id
+        draft.version += 1
+        draft.updated_at = datetime.utcnow()
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftReassigned event
+        await event_bus.publish(DraftReassigned(
+            draft_id=draft.id,
+            old_table_session_id=old_table_session_id,
+            new_table_session_id=new_table_session_id,
+            tenant_id=draft.tenant_id,
+            reassigned_by=current_user_id
+        ))
+
+        logger.info(f"Reassigned draft {draft_id} from session {old_table_session_id} to {new_table_session_id}")
+        return {
+            "message": "Draft reassigned",
+            "draft_id": str(draft_id),
+            "old_table_session_id": str(old_table_session_id),
+            "new_table_session_id": str(new_table_session_id),
+            "reassigned_at": draft.updated_at
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error reassigning draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reassign draft"
+        )
+
+    """Schema for creating a draft line item"""
+    menu_item_id: uuid.UUID
+    name: str
+    quantity: int
+    price_at_order: Decimal
+    special_instructions: Optional[str] = None
+    modifiers: Optional[dict] = None
+    parent_line_item_id: Optional[uuid.UUID] = None
+    sort_order: int = 0
+
+
+class DraftCreate(SQLModel):
+    """Schema for creating a draft"""
+    table_session_id: uuid.UUID
+    special_requests: Optional[str] = None
+
+
+class DraftUpdate(SQLModel):
+    """Schema for updating a draft"""
+    version: int  # Required for optimistic concurrency
+    special_requests: Optional[str] = None
+    line_items: Optional[List[DraftLineItemCreate]] = None
+
+
+class DraftResponse(SQLModel):
+    """Schema for draft response"""
+    id: uuid.UUID
+    table_session_id: uuid.UUID
+    status: DraftStatus
+    version: int
+    locked_by: Optional[uuid.UUID] = None
+    locked_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    expires_at: datetime
+    special_requests: Optional[str] = None
+
+
+class DraftDetailResponse(DraftResponse):
+    """Schema for draft with line items"""
+    line_items: List[DraftLineItem]
+
+
+@router.post("/", response_model=DraftResponse)
+async def create_draft(
+    draft_data: DraftCreate,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Create a new draft order (guest submits)"""
+    try:
+        # Verify table session exists and belongs to tenant
+        table_session = session.exec(
+            select(TableSession).where(
+                TableSession.id == draft_data.table_session_id,
+                TableSession.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not table_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Table session not found"
+            )
+
+        # Create draft
+        draft = DraftOrder(
+            tenant_id=tenant_id,
+            table_session_id=draft_data.table_session_id,
+            status=DraftStatus.DRAFT,
+            special_requests=draft_data.special_requests
+        )
+        session.add(draft)
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftCreated event
+        await event_bus.publish(DraftCreated(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id
+        ))
+
+        logger.info(f"Created draft {draft.id} for session {draft_data.table_session_id}")
+        return draft
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error creating draft: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create draft"
+        )
+
+
+@router.get("/", response_model=List[DraftResponse])
+async def list_drafts(
+    status_filter: Optional[DraftStatus] = Query(None, description="Filter by status"),
+    table_session_id: Optional[uuid.UUID] = Query(None, description="Filter by table session"),
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    user_role: str = Depends(get_user_role),
+    session: Session = Depends(get_session)
+):
+    """List drafts (waiter inbox or guest history)"""
+    try:
+        query = select(DraftOrder).where(DraftOrder.tenant_id == tenant_id)
+
+        # Apply filters
+        if status_filter:
+            query = query.where(DraftOrder.status == status_filter)
+
+        if table_session_id:
+            query = query.where(DraftOrder.table_session_id == table_session_id)
+
+        # Filter expired drafts (waiters shouldn't see expired drafts)
+        query = query.where(DraftOrder.expires_at > datetime.utcnow())
+
+        # Sort by created_at (newest first for inbox)
+        query = query.order_by(DraftOrder.created_at.desc())
+
+        drafts = session.exec(query).all()
+        return drafts
+
+    except Exception as e:
+        logger.error(f"Error listing drafts: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list drafts"
+        )
+
+
+@router.get("/{draft_id}", response_model=DraftDetailResponse)
+async def get_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Get draft details with line items"""
+    try:
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Get line items
+        line_items = session.exec(
+            select(DraftLineItem).where(DraftLineItem.draft_order_id == draft_id)
+            .order_by(DraftLineItem.sort_order)
+        ).all()
+
+        # Return draft with line items
+        return {
+            "id": draft.id,
+            "table_session_id": draft.table_session_id,
+            "status": draft.status,
+            "version": draft.version,
+            "locked_by": draft.locked_by,
+            "locked_at": draft.locked_at,
+            "rejection_reason": draft.rejection_reason,
+            "created_at": draft.created_at,
+            "updated_at": draft.updated_at,
+            "expires_at": draft.expires_at,
+            "special_requests": draft.special_requests,
+            "line_items": line_items
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get draft"
+        )
+
+
+@router.patch("/{draft_id}", response_model=DraftResponse)
+async def update_draft(
+    draft_id: uuid.UUID,
+    update_data: DraftUpdate,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Update draft with optimistic concurrency control"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Optimistic concurrency check
+        if draft.version != update_data.version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Draft was modified by another user. Current version: {draft.version}, your version: {update_data.version}"
+            )
+
+        # Check if draft can be modified
+        if not draft.can_modify():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot modify draft in status: {draft.status}"
+            )
+
+        # Update draft fields
+        if update_data.special_requests is not None:
+            draft.special_requests = update_data.special_requests
+
+        # Update line items if provided
+        if update_data.line_items is not None:
+            # Delete existing line items
+            session.exec(
+                select(DraftLineItem).where(DraftLineItem.draft_order_id == draft_id)
+            ).delete()
+
+            # Add new line items
+            for item_data in update_data.line_items:
+                line_item = DraftLineItem(
+                    tenant_id=tenant_id,
+                    draft_order_id=draft_id,
+                    menu_item_id=item_data.menu_item_id,
+                    name=item_data.name,
+                    quantity=item_data.quantity,
+                    price_at_order=item_data.price_at_order,
+                    special_instructions=item_data.special_instructions,
+                    modifiers=item_data.modifiers,
+                    parent_line_item_id=item_data.parent_line_item_id,
+                    sort_order=item_data.sort_order
+                )
+                # Calculate line total
+                line_item.calculate_line_total()
+                session.add(line_item)
+
+        # Update version and timestamp
+        draft.version += 1
+        draft.updated_at = datetime.utcnow()
+
+        session.commit()
+        session.refresh(draft)
+
+        logger.info(f"Updated draft {draft_id} to version {draft.version}")
+        return draft
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error updating draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update draft"
+        )
+
+
+@router.post("/{draft_id}/submit", response_model=DraftResponse)
+async def submit_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Submit draft for waiter review (guest action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to pending
+        draft.transition_to_pending()
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftSubmitted event
+        await event_bus.publish(DraftSubmitted(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            guest_count=draft.table_session.guest_count if draft.table_session else 1
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_update(
+            draft_id=draft.id,
+            status=draft.status.value,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Submitted draft {draft_id} for review")
+        return draft
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error submitting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit draft"
+        )
+
+
+@router.patch("/{draft_id}/acquire")
+async def acquire_draft_lock(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Acquire lock on draft (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Try to acquire lock
+        try:
+            draft.acquire_lock(current_user_id)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e)
+            )
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftAcquired event
+        await event_bus.publish(DraftAcquired(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_locked(
+            draft_id=draft.id,
+            locked_by=current_user_id,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"User {current_user_id} acquired lock on draft {draft_id}")
+        return {"message": "Lock acquired", "draft_id": str(draft_id), "locked_at": draft.locked_at}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error acquiring lock on draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to acquire lock"
+        )
+
+
+@router.patch("/{draft_id}/confirm")
+async def confirm_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Confirm draft and create order (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # TODO: Create actual order from draft
+        # For now, generate a placeholder order_id
+        order_id = uuid.uuid4()
+
+        # Transition to confirmed
+        draft.transition_to_confirmed(current_user_id, order_id)
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftConfirmed event
+        await event_bus.publish(DraftConfirmed(
+            draft_id=draft.id,
+            order_id=order_id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id,
+            items=[],
+            total_amount=0.0  # TODO: Calculate from line items
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_confirmed(
+            draft_id=draft.id,
+            order_id=order_id,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Confirmed draft {draft_id}, created order {order_id}")
+        return {
+            "message": "Draft confirmed",
+            "draft_id": str(draft_id),
+            "order_id": str(order_id),
+            "confirmed_at": draft.confirmed_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error confirming draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to confirm draft"
+        )
+
+
+@router.patch("/{draft_id}/reject")
+async def reject_draft(
+    draft_id: uuid.UUID,
+    reason: str = Query(..., min_length=1, max_length=1000),
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Reject draft (waiter action)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to rejected
+        draft.transition_to_rejected(current_user_id, reason)
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftRejected event
+        await event_bus.publish(DraftRejected(
+            draft_id=draft.id,
+            table_session_id=draft.table_session_id,
+            tenant_id=draft.tenant_id,
+            waiter_id=current_user_id,
+            reason=reason
+        ))
+
+        # Send WebSocket notification
+        await manager.send_draft_rejected(
+            draft_id=draft.id,
+            reason=reason,
+            table_session_id=draft.table_session_id
+        )
+
+        logger.info(f"Rejected draft {draft_id}: {reason}")
+        return {
+            "message": "Draft rejected",
+            "draft_id": str(draft_id),
+            "reason": reason,
+            "rejected_at": draft.rejected_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error rejecting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reject draft"
+        )
+
+
+@router.patch("/{draft_id}/expire")
+async def expire_draft(
+    draft_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Manually expire draft (admin action or background job)"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Transition to expired
+        draft.transition_to_expired()
+
+        session.commit()
+        session.refresh(draft)
+
+        logger.info(f"Expired draft {draft_id}")
+        return {
+            "message": "Draft expired",
+            "draft_id": str(draft_id),
+            "expired_at": draft.updated_at
+        }
+
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error expiring draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to expire draft"
+        )
+
+
+@router.patch("/{draft_id}/reassign")
+async def reassign_draft(
+    draft_id: uuid.UUID,
+    new_table_session_id: uuid.UUID,
+    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    current_user_id: uuid.UUID = Depends(get_current_user_id),
+    session: Session = Depends(get_session)
+):
+    """Reassign draft to different table session"""
+    try:
+        # Get draft
+        draft = session.exec(
+            select(DraftOrder).where(
+                DraftOrder.id == draft_id,
+                DraftOrder.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not draft:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Draft not found"
+            )
+
+        # Verify new table session exists and belongs to tenant
+        new_session = session.exec(
+            select(TableSession).where(
+                TableSession.id == new_table_session_id,
+                TableSession.tenant_id == tenant_id
+            )
+        ).first()
+
+        if not new_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="New table session not found"
+            )
+
+        # Verify draft can be reassigned (only draft or pending status)
+        if draft.status not in [DraftStatus.DRAFT, DraftStatus.PENDING]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot reassign draft in status: {draft.status}"
+            )
+
+        # Store old table session for notification
+        old_table_session_id = draft.table_session_id
+
+        # Reassign draft
+        draft.table_session_id = new_table_session_id
+        draft.version += 1
+        draft.updated_at = datetime.utcnow()
+
+        session.commit()
+        session.refresh(draft)
+
+        # Emit DraftReassigned event
+        await event_bus.publish(DraftReassigned(
+            draft_id=draft.id,
+            old_table_session_id=old_table_session_id,
+            new_table_session_id=new_table_session_id,
+            tenant_id=draft.tenant_id,
+            reassigned_by=current_user_id
+        ))
+
+        logger.info(f"Reassigned draft {draft_id} from session {old_table_session_id} to {new_table_session_id}")
+        return {
+            "message": "Draft reassigned",
+            "draft_id": str(draft_id),
+            "old_table_session_id": str(old_table_session_id),
+            "new_table_session_id": str(new_table_session_id),
+            "reassigned_at": draft.updated_at
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error reassigning draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reassign draft"
+        )
